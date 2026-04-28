@@ -38,6 +38,7 @@ use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::ControlFlow;
 use reth_tasks::{spawn_os_thread, utils::increase_thread_priority};
 use reth_trie_db::ChangesetCache;
+use reth_trie_parallel::state_root_task::StateRootHandle;
 use revm::interpreter::debug_unreachable;
 use state::TreeState;
 use std::{collections::HashMap, fmt::Debug, ops, sync::Arc, time::Duration};
@@ -92,6 +93,51 @@ pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 /// This ensures that recent trie changesets are kept in memory for potential reorgs,
 /// even when the finalized block is not set (e.g., on L2s like Optimism).
 const CHANGESET_CACHE_RETENTION_BLOCKS: u64 = 64;
+
+/// Error returned when requesting a sparse trie / state-root handle from the engine tree.
+#[derive(Debug, thiserror::Error)]
+pub enum SparseTrieHandleError {
+    /// The request channel to the engine tree was closed before the request could be sent.
+    #[error("failed sending sparse trie handle request to the engine tree")]
+    RequestChannelClosed,
+    /// The engine tree dropped the response channel before returning the result.
+    #[error("failed receiving sparse trie handle response from the engine tree")]
+    ResponseChannelClosed,
+}
+
+/// Request sent to the engine tree to create a sparse trie / state-root handle anchored to a
+/// specific parent.
+#[derive(Debug)]
+pub struct SparseTrieHandleRequest {
+    parent_hash: B256,
+    parent_state_root: B256,
+    tx: oneshot::Sender<Option<StateRootHandle>>,
+}
+
+/// Cloneable sender that requests sparse trie / state-root handles from the engine tree.
+#[derive(Debug, Clone)]
+pub struct SparseTrieHandleSender {
+    tx: Sender<SparseTrieHandleRequest>,
+}
+
+impl SparseTrieHandleSender {
+    const fn new(tx: Sender<SparseTrieHandleRequest>) -> Self {
+        Self { tx }
+    }
+
+    /// Requests a sparse trie / state-root handle from the engine tree for the given parent.
+    pub async fn spawn_sparse_trie_handle(
+        &self,
+        parent_hash: B256,
+        parent_state_root: B256,
+    ) -> Result<Option<StateRootHandle>, SparseTrieHandleError> {
+        let (tx, rx) = oneshot::channel::<Option<StateRootHandle>>();
+        self.tx
+            .send(SparseTrieHandleRequest { parent_hash, parent_state_root, tx })
+            .map_err(|_| SparseTrieHandleError::RequestChannelClosed)?;
+        rx.await.map_err(|_| SparseTrieHandleError::ResponseChannelClosed)
+    }
+}
 
 /// A builder for creating state providers that can be used across threads.
 #[derive(Clone, Debug)]
@@ -276,6 +322,10 @@ where
     incoming_tx: Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
     /// Incoming engine API requests.
     incoming: Receiver<FromEngine<EngineApiRequest<T, N>, N::Block>>,
+    /// Incoming sparse trie handle requests.
+    trie_incoming: Receiver<SparseTrieHandleRequest>,
+    /// Whether all sparse trie request senders were dropped.
+    trie_incoming_closed: bool,
     /// Outgoing events that are emitted to the handler.
     outgoing: UnboundedSender<EngineApiEvent<N>>,
     /// Channels to the persistence layer.
@@ -373,6 +423,7 @@ where
         evm_config: C,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
+        trie_incoming: Receiver<SparseTrieHandleRequest>,
     ) -> Self {
         let (incoming_tx, incoming) = crossbeam_channel::unbounded();
 
@@ -381,6 +432,8 @@ where
             consensus,
             payload_validator,
             incoming,
+            trie_incoming,
+            trie_incoming_closed: false,
             outgoing,
             persistence,
             persistence_state,
@@ -417,7 +470,11 @@ where
         evm_config: C,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
-    ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
+    ) -> (
+        Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
+        UnboundedReceiver<EngineApiEvent<N>>,
+        SparseTrieHandleSender,
+    )
     {
         let best_block_number = provider.best_block_number().unwrap_or(0);
         let header = provider.sealed_header(best_block_number).ok().flatten().unwrap_or_default();
@@ -428,6 +485,7 @@ where
         };
 
         let (tx, outgoing) = unbounded_channel();
+        let (trie_tx, trie_incoming) = crossbeam_channel::unbounded();
         let state = EngineApiTreeState::new(
             config.block_buffer_limit(),
             config.max_invalid_header_cache_length(),
@@ -450,13 +508,14 @@ where
             evm_config,
             changeset_cache,
             runtime,
+            trie_incoming,
         );
         let incoming = task.incoming_tx.clone();
         spawn_os_thread("engine", || {
             increase_thread_priority();
             task.run()
         });
-        (incoming, outgoing)
+        (incoming, outgoing, SparseTrieHandleSender::new(trie_tx))
     }
 
     /// Returns a [`TreeOutcome`] indicating the forkchoice head is valid and canonical.
@@ -562,6 +621,22 @@ where
                         return
                     }
                 }
+                LoopEvent::TrieHandleRequest(req) => {
+                    let handle = self.payload_validator.sparse_trie_handle_for(
+                        req.parent_hash,
+                        req.parent_state_root,
+                        &self.state,
+                    );
+                    if let Err(err) = req.tx.send(handle) {
+                        warn!(
+                            target: "engine::tree",
+                            parent_hash = %req.parent_hash,
+                            parent_state_root = %req.parent_state_root,
+                            "failed to deliver sparse trie handle response, receiver dropped: {err:?}"
+                        );
+                    }
+                }
+                LoopEvent::Noop => continue,
                 LoopEvent::Disconnected => {
                     error!(target: "engine::tree", "Channel disconnected");
                     return
@@ -607,33 +682,73 @@ where
         let maybe_persistence = self.persistence_state.rx.take();
 
         if let Some((persistence_rx, start_time, action)) = maybe_persistence {
-            // Biased select prioritizes persistence completion to update in memory state and
-            // unblock further writes
-            crossbeam_channel::select_biased! {
-                recv(persistence_rx) -> result => {
-                    // Don't put it back - consumed (oneshot-like behavior)
-                    match result {
-                        Ok(result) => LoopEvent::PersistenceComplete {
-                            result,
-                            start_time,
-                        },
-                        Err(_) => LoopEvent::Disconnected,
-                    }
-                },
-                recv(self.incoming) -> msg => {
-                    // Put the persistence rx back - we didn't consume it
-                    self.persistence_state.rx = Some((persistence_rx, start_time, action));
-                    match msg {
-                        Ok(m) => LoopEvent::EngineMessage(m),
-                        Err(_) => LoopEvent::Disconnected,
-                    }
-                },
+            if self.trie_incoming_closed {
+                crossbeam_channel::select_biased! {
+                    recv(persistence_rx) -> result => {
+                        match result {
+                            Ok(result) => LoopEvent::PersistenceComplete { result, start_time },
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
+                    recv(self.incoming) -> msg => {
+                        self.persistence_state.rx = Some((persistence_rx, start_time, action));
+                        match msg {
+                            Ok(m) => LoopEvent::EngineMessage(m),
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
+                }
+            } else {
+                crossbeam_channel::select_biased! {
+                    recv(persistence_rx) -> result => {
+                        match result {
+                            Ok(result) => LoopEvent::PersistenceComplete { result, start_time },
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
+                    recv(self.trie_incoming) -> req => {
+                        self.persistence_state.rx = Some((persistence_rx, start_time, action));
+                        match req {
+                            Ok(req) => LoopEvent::TrieHandleRequest(req),
+                            Err(_) => {
+                                self.trie_incoming_closed = true;
+                                LoopEvent::Noop
+                            }
+                        }
+                    },
+                    recv(self.incoming) -> msg => {
+                        self.persistence_state.rx = Some((persistence_rx, start_time, action));
+                        match msg {
+                            Ok(m) => LoopEvent::EngineMessage(m),
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
+                }
             }
         } else {
-            // No persistence in progress - just wait on incoming
-            match self.incoming.recv() {
-                Ok(m) => LoopEvent::EngineMessage(m),
-                Err(_) => LoopEvent::Disconnected,
+            if self.trie_incoming_closed {
+                match self.incoming.recv() {
+                    Ok(m) => LoopEvent::EngineMessage(m),
+                    Err(_) => LoopEvent::Disconnected,
+                }
+            } else {
+                crossbeam_channel::select_biased! {
+                    recv(self.trie_incoming) -> req => {
+                        match req {
+                            Ok(req) => LoopEvent::TrieHandleRequest(req),
+                            Err(_) => {
+                                self.trie_incoming_closed = true;
+                                LoopEvent::Noop
+                            }
+                        }
+                    },
+                    recv(self.incoming) -> msg => {
+                        match msg {
+                            Ok(m) => LoopEvent::EngineMessage(m),
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
+                }
             }
         }
     }
@@ -3294,6 +3409,8 @@ where
 {
     /// An engine API message was received.
     EngineMessage(FromEngine<EngineApiRequest<T, N>, N::Block>),
+    /// A sparse trie handle request was received.
+    TrieHandleRequest(SparseTrieHandleRequest),
     /// A persistence task completed.
     PersistenceComplete {
         /// The unified result of the persistence operation.
@@ -3301,6 +3418,8 @@ where
         /// When the persistence operation started.
         start_time: Instant,
     },
+    /// Internal no-op used when an optional side channel is closed.
+    Noop,
     /// A channel was disconnected.
     Disconnected,
 }

@@ -193,6 +193,7 @@ impl TestHarness {
 
         let (to_payload_service, _payload_command_rx) = unbounded_channel();
         let payload_builder = PayloadBuilderHandle::new(to_payload_service);
+        let (_trie_tx, trie_rx) = crossbeam_channel::unbounded();
 
         let evm_config = MockEvmConfig::default();
         let changeset_cache = ChangesetCache::new();
@@ -223,6 +224,7 @@ impl TestHarness {
             evm_config,
             changeset_cache,
             reth_tasks::Runtime::test(),
+            trie_rx,
         );
 
         let block_builder = TestBlockBuilder::default().with_chain_spec((*chain_spec).clone());

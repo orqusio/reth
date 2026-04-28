@@ -1,10 +1,12 @@
 //! Builder support for rpc components.
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
+use reth_engine_tree::{SparseTrieHandleError, SparseTrieHandleSender};
 use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
 pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity, Stack};
 pub use reth_trie_db::ChangesetCache;
+use reth_trie_parallel::state_root_task::StateRootHandle;
 
 use crate::{
     invalid_block_hook::InvalidBlockHookExt, ConfigureEngineEvm, ConsensusEngineEvent,
@@ -339,6 +341,9 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
     /// Handle to trigger engine shutdown.
     pub engine_shutdown: EngineShutdown,
+    /// Optional side channel into the engine tree for constructing sparse trie / state-root
+    /// handles from the tree's live in-memory state.
+    pub sparse_trie_handle_sender: Option<SparseTrieHandleSender>,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -349,6 +354,7 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, Et
             engine_events: self.engine_events.clone(),
             beacon_engine_handle: self.beacon_engine_handle.clone(),
             engine_shutdown: self.engine_shutdown.clone(),
+            sparse_trie_handle_sender: self.sparse_trie_handle_sender.clone(),
         }
     }
 }
@@ -370,6 +376,7 @@ where
             .field("rpc_server_handles", &self.rpc_server_handles)
             .field("rpc_registry", &self.rpc_registry)
             .field("engine_shutdown", &self.engine_shutdown)
+            .field("sparse_trie_handle_sender", &self.sparse_trie_handle_sender)
             .finish()
     }
 }
@@ -394,6 +401,19 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> RpcHandle<Node, EthApi> {
         &self,
     ) -> &EventSender<ConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>> {
         &self.engine_events
+    }
+
+    /// Requests a sparse trie / state-root handle from the engine tree, if this node launched the
+    /// optional tree side channel.
+    pub async fn spawn_sparse_trie_handle(
+        &self,
+        parent_hash: alloy_primitives::B256,
+        parent_state_root: alloy_primitives::B256,
+    ) -> Result<Option<StateRootHandle>, SparseTrieHandleError> {
+        match &self.sparse_trie_handle_sender {
+            Some(sender) => sender.spawn_sparse_trie_handle(parent_hash, parent_state_root).await,
+            None => Ok(None),
+        }
     }
 
     /// Returns the `EthApi` instance of the rpc server.
@@ -966,6 +986,7 @@ where
             engine_events,
             beacon_engine_handle: engine_handle,
             engine_shutdown: EngineShutdown::default(),
+            sparse_trie_handle_sender: None,
         })
     }
 

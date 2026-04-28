@@ -108,6 +108,7 @@ pub mod metrics;
 pub mod persistence;
 /// Support for interacting with the blockchain tree.
 pub mod tree;
+pub use tree::{SparseTrieHandleError, SparseTrieHandleSender};
 
 /// Test utilities.
 #[cfg(any(test, feature = "test-utils"))]

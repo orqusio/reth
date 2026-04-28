@@ -10,7 +10,7 @@ use crate::{
     download::BasicBlockDownloader,
     engine::{EngineApiKind, EngineApiRequest, EngineApiRequestHandler, EngineHandler},
     persistence::PersistenceHandle,
-    tree::{EngineApiTreeHandler, EngineValidator, TreeConfig, WaitForCaches},
+    tree::{EngineApiTreeHandler, EngineValidator, SparseTrieHandleSender, TreeConfig, WaitForCaches},
 };
 use futures::Stream;
 use reth_consensus::FullConsensus;
@@ -65,14 +65,17 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     evm_config: C,
     changeset_cache: ChangesetCache,
     runtime: Runtime,
-) -> ChainOrchestrator<
+) -> (
+    ChainOrchestrator<
     EngineHandler<
         EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
         S,
         BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
     >,
     PipelineSync<N>,
->
+    >,
+    SparseTrieHandleSender,
+)
 where
     N: ProviderNodeTypes,
     Client: BlockClient<Block = <N::Primitives as NodePrimitives>::Block> + 'static,
@@ -87,7 +90,7 @@ where
 
     let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 
-    let (to_tree_tx, from_tree) = EngineApiTreeHandler::spawn_new(
+    let (to_tree_tx, from_tree, sparse_trie_handle_sender) = EngineApiTreeHandler::spawn_new(
         blockchain_db,
         consensus,
         payload_validator,
@@ -106,5 +109,5 @@ where
 
     let backfill_sync = PipelineSync::new(pipeline, pipeline_task_spawner);
 
-    ChainOrchestrator::new(handler, backfill_sync)
+    (ChainOrchestrator::new(handler, backfill_sync), sparse_trie_handle_sender)
 }

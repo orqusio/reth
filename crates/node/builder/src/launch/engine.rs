@@ -226,7 +226,7 @@ impl EngineNodeLauncher {
             EngineApiKind::Ethereum
         };
 
-        let mut orchestrator = build_engine_orchestrator(
+        let (mut orchestrator, sparse_trie_handle_sender) = build_engine_orchestrator(
             engine_kind,
             consensus.clone(),
             network_client.clone(),
@@ -271,6 +271,7 @@ impl EngineNodeLauncher {
             engine_events,
             beacon_engine_handle,
             engine_shutdown: _,
+            sparse_trie_handle_sender: _,
         } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Create engine shutdown handle
@@ -409,6 +410,7 @@ impl EngineNodeLauncher {
                 engine_events,
                 beacon_engine_handle,
                 engine_shutdown,
+                sparse_trie_handle_sender: Some(sparse_trie_handle_sender),
             },
         };
         // Notify on node started
