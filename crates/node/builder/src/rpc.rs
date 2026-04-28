@@ -1,12 +1,11 @@
 //! Builder support for rpc components.
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
-use reth_engine_tree::{SparseTrieHandleError, SparseTrieHandleSender};
+use reth_engine_tree::{SparseTrieBuildContext, SparseTrieHandleError, SparseTrieHandleSender};
 use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
 pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity, Stack};
 pub use reth_trie_db::ChangesetCache;
-use reth_trie_parallel::state_root_task::StateRootHandle;
 
 use crate::{
     invalid_block_hook::InvalidBlockHookExt, ConfigureEngineEvm, ConsensusEngineEvent,
@@ -409,7 +408,7 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> RpcHandle<Node, EthApi> {
         &self,
         parent_hash: alloy_primitives::B256,
         parent_state_root: alloy_primitives::B256,
-    ) -> Result<Option<StateRootHandle>, SparseTrieHandleError> {
+    ) -> Result<Option<SparseTrieBuildContext>, SparseTrieHandleError> {
         match &self.sparse_trie_handle_sender {
             Some(sender) => sender.spawn_sparse_trie_handle(parent_hash, parent_state_root).await,
             None => Ok(None),

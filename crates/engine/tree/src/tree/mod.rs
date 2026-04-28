@@ -105,13 +105,22 @@ pub enum SparseTrieHandleError {
     ResponseChannelClosed,
 }
 
+/// Engine tree build context shared with payload-building callers.
+#[derive(Debug)]
+pub struct SparseTrieBuildContext {
+    /// Execution cache anchored to the same parent/live tree view.
+    pub cache: Option<SavedCache>,
+    /// Sparse trie / state-root handle anchored to the same parent/live tree view.
+    pub trie_handle: Option<StateRootHandle>,
+}
+
 /// Request sent to the engine tree to create a sparse trie / state-root handle anchored to a
 /// specific parent.
 #[derive(Debug)]
 pub struct SparseTrieHandleRequest {
     parent_hash: B256,
     parent_state_root: B256,
-    tx: oneshot::Sender<Option<StateRootHandle>>,
+    tx: oneshot::Sender<Option<SparseTrieBuildContext>>,
 }
 
 /// Cloneable sender that requests sparse trie / state-root handles from the engine tree.
@@ -130,8 +139,8 @@ impl SparseTrieHandleSender {
         &self,
         parent_hash: B256,
         parent_state_root: B256,
-    ) -> Result<Option<StateRootHandle>, SparseTrieHandleError> {
-        let (tx, rx) = oneshot::channel::<Option<StateRootHandle>>();
+    ) -> Result<Option<SparseTrieBuildContext>, SparseTrieHandleError> {
+        let (tx, rx) = oneshot::channel::<Option<SparseTrieBuildContext>>();
         self.tx
             .send(SparseTrieHandleRequest { parent_hash, parent_state_root, tx })
             .map_err(|_| SparseTrieHandleError::RequestChannelClosed)?;
@@ -622,12 +631,14 @@ where
                     }
                 }
                 LoopEvent::TrieHandleRequest(req) => {
-                    let handle = self.payload_validator.sparse_trie_handle_for(
+                    let trie_handle = self.payload_validator.sparse_trie_handle_for(
                         req.parent_hash,
                         req.parent_state_root,
                         &self.state,
                     );
-                    if let Err(err) = req.tx.send(handle) {
+                    let cache = self.payload_validator.cache_for(req.parent_hash);
+                    let ctx = SparseTrieBuildContext { cache, trie_handle };
+                    if let Err(err) = req.tx.send(Some(ctx)) {
                         warn!(
                             target: "engine::tree",
                             parent_hash = %req.parent_hash,
@@ -706,6 +717,13 @@ where
                             Err(_) => LoopEvent::Disconnected,
                         }
                     },
+                    recv(self.incoming) -> msg => {
+                        self.persistence_state.rx = Some((persistence_rx, start_time, action));
+                        match msg {
+                            Ok(m) => LoopEvent::EngineMessage(m),
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
                     recv(self.trie_incoming) -> req => {
                         self.persistence_state.rx = Some((persistence_rx, start_time, action));
                         match req {
@@ -714,13 +732,6 @@ where
                                 self.trie_incoming_closed = true;
                                 LoopEvent::Noop
                             }
-                        }
-                    },
-                    recv(self.incoming) -> msg => {
-                        self.persistence_state.rx = Some((persistence_rx, start_time, action));
-                        match msg {
-                            Ok(m) => LoopEvent::EngineMessage(m),
-                            Err(_) => LoopEvent::Disconnected,
                         }
                     },
                 }
@@ -733,6 +744,12 @@ where
                 }
             } else {
                 crossbeam_channel::select_biased! {
+                    recv(self.incoming) -> msg => {
+                        match msg {
+                            Ok(m) => LoopEvent::EngineMessage(m),
+                            Err(_) => LoopEvent::Disconnected,
+                        }
+                    },
                     recv(self.trie_incoming) -> req => {
                         match req {
                             Ok(req) => LoopEvent::TrieHandleRequest(req),
@@ -740,12 +757,6 @@ where
                                 self.trie_incoming_closed = true;
                                 LoopEvent::Noop
                             }
-                        }
-                    },
-                    recv(self.incoming) -> msg => {
-                        match msg {
-                            Ok(m) => LoopEvent::EngineMessage(m),
-                            Err(_) => LoopEvent::Disconnected,
                         }
                     },
                 }
