@@ -22,7 +22,7 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuiltPayload, PayloadAttributes, PayloadKind};
 use reth_primitives_traits::{HeaderTy, NodePrimitives, SealedHeader};
 use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop};
-use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{BlockReaderIdExt, StateProviderBox, StateProviderFactory};
 use reth_tasks::Runtime;
 use reth_trie_parallel::state_root_task::StateRootHandle;
 use std::{
@@ -179,6 +179,7 @@ where
             cached_reads,
             execution_cache: input.cache,
             trie_handle: input.trie_handle,
+            state_provider: input.state_provider,
             payload_task_guard: self.payload_task_guard.clone(),
             metrics: Default::default(),
             builder: self.builder.clone(),
@@ -303,7 +304,7 @@ impl Default for BasicPayloadJobGeneratorConfig {
 /// [`BuildOutcome::Freeze`]. Once a frozen payload is returned, no additional payloads will be
 /// built and this future will wait to be resolved: [`PayloadJob::resolve`] or terminated if the
 /// deadline is reached.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub struct BasicPayloadJob<Builder>
 where
     Builder: PayloadBuilder,
@@ -331,6 +332,12 @@ where
     execution_cache: Option<SavedCache>,
     /// Optional state root task handle, shared with the engine.
     trie_handle: Option<StateRootHandle>,
+    /// Optional state provider anchored to the same parent view as `trie_handle`.
+    ///
+    /// One-shot: consumed by the first build; subsequent rebuilds fall back to the builder's
+    /// own provider. Pairs with `trie_handle` to keep EVM and multiproof workers consistent.
+    #[debug(skip)]
+    state_provider: Option<StateProviderBox>,
     /// metrics for this type
     metrics: PayloadBuilderMetrics,
     /// The type responsible for building payloads.
@@ -358,6 +365,7 @@ where
         let cached_reads = self.cached_reads.take().unwrap_or_default();
         let execution_cache = self.execution_cache.clone();
         let trie_handle = self.trie_handle.take();
+        let state_provider = self.state_provider.take();
         let builder = self.builder.clone();
         self.executor.spawn_blocking_task(async move {
             // acquire the permit for executing the task
@@ -366,6 +374,7 @@ where
                 cached_reads,
                 execution_cache,
                 trie_handle,
+                state_provider,
                 config: payload_config,
                 cancel,
                 best_payload,
@@ -501,6 +510,7 @@ where
                 cached_reads: self.cached_reads.take().unwrap_or_default(),
                 execution_cache: self.execution_cache.clone(),
                 trie_handle: None,
+                state_provider: None,
                 config: self.config.clone(),
                 cancel: CancelOnDrop::default(),
                 best_payload: None,
@@ -824,7 +834,7 @@ impl<Payload> BuildOutcomeKind<Payload> {
 /// This struct encapsulates the essential components and configuration required for the payload
 /// building process. It holds references to the Ethereum client, transaction pool, cached reads,
 /// payload configuration, cancellation status, and the best payload achieved so far.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub struct BuildArguments<Attributes, Payload: BuiltPayload> {
     /// Previously cached disk reads
     pub cached_reads: CachedReads,
@@ -837,6 +847,14 @@ pub struct BuildArguments<Attributes, Payload: BuiltPayload> {
     /// root, so if the next `newPayload` is not on top of that block, the trie cache is
     /// invalidated and cleared.
     pub trie_handle: Option<StateRootHandle>,
+    /// Optional state provider anchored to the same parent view as `trie_handle`.
+    ///
+    /// When set, builders should use this provider for EVM execution to keep their state view
+    /// consistent with the multiproof workers backing `trie_handle`. Falling back to a
+    /// `BlockchainProvider`-derived provider when in-memory blocks are present can yield a
+    /// stale view (see [`BuildNewPayload::state_provider`]).
+    #[debug(skip)]
+    pub state_provider: Option<StateProviderBox>,
     /// How to configure the payload.
     pub config: PayloadConfig<Attributes, HeaderTy<Payload::Primitives>>,
     /// A marker that can be used to cancel the job.
@@ -855,7 +873,15 @@ impl<Attributes, Payload: BuiltPayload> BuildArguments<Attributes, Payload> {
         cancel: CancelOnDrop,
         best_payload: Option<Payload>,
     ) -> Self {
-        Self { cached_reads, execution_cache, trie_handle, config, cancel, best_payload }
+        Self {
+            cached_reads,
+            execution_cache,
+            trie_handle,
+            state_provider: None,
+            config,
+            cancel,
+            best_payload,
+        }
     }
 }
 

@@ -1951,6 +1951,18 @@ pub trait EngineValidator<
         parent_state_root: B256,
         state: &EngineApiTreeState<N>,
     ) -> Option<StateRootHandle>;
+
+    /// Returns a state provider anchored to the same parent view used by `sparse_trie_handle_for`.
+    ///
+    /// Payload builders should use this for EVM execution when also using the sparse trie handle,
+    /// so that the EVM and the multiproof workers see the same composite (DB + in-memory)
+    /// state. Reading state via `BlockchainProvider::state_by_block_hash` instead can lag
+    /// `EngineApiTreeState` between newPayload and forkchoiceUpdated and produce wrong roots.
+    fn state_provider_for(
+        &self,
+        parent_hash: B256,
+        state: &EngineApiTreeState<N>,
+    ) -> ProviderResult<Option<reth_provider::StateProviderBox>>;
 }
 
 impl<N, Types, P, Evm, V> EngineValidator<Types> for BasicEngineValidator<P, Evm, V>
@@ -2038,6 +2050,17 @@ where
             false,
             &self.config,
         ))
+    }
+
+    fn state_provider_for(
+        &self,
+        parent_hash: B256,
+        state: &EngineApiTreeState<N>,
+    ) -> ProviderResult<Option<reth_provider::StateProviderBox>> {
+        match self.state_provider_builder(parent_hash, state)? {
+            Some(builder) => Ok(Some(builder.build()?)),
+            None => Ok(None),
+        }
     }
 }
 

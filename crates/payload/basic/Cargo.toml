@@ -39,5 +39,6 @@ reth-metrics.workspace = true
 metrics.workspace = true
 
 # misc
+derive_more.workspace = true
 tracing.workspace = true
 serde.workspace = true

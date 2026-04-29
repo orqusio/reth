@@ -16,6 +16,7 @@ use reth_execution_cache::SavedCache;
 use reth_payload_builder_primitives::{Events, PayloadBuilderError, PayloadEvents};
 use reth_payload_primitives::{BuiltPayload, PayloadAttributes, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
+use reth_storage_api::StateProviderBox;
 use reth_trie_parallel::state_root_task::StateRootHandle;
 use std::{
     future::Future,
@@ -534,8 +535,8 @@ pub enum PayloadServiceCommand<T: PayloadTypes> {
 }
 
 /// A request to build a new payload.
-#[derive(Debug)]
-pub struct BuildNewPayload<T> {
+#[derive(derive_more::Debug)]
+pub struct BuildNewPayload<T: std::fmt::Debug> {
     /// The attributes for the new payload
     pub attributes: T,
     /// The parent hash of the new payload
@@ -546,6 +547,17 @@ pub struct BuildNewPayload<T> {
     pub cache: Option<SavedCache>,
     /// Optional handle to a background sparse trie task.
     pub trie_handle: Option<StateRootHandle>,
+    /// Optional state provider anchored to the same parent view as `trie_handle`.
+    ///
+    /// When the engine tree builds the trie handle, it also resolves a state provider that
+    /// composes the persisted DB state at the same anchor with any in-memory blocks leading to
+    /// the parent. Payload builders should use this provider for EVM execution to keep their
+    /// view consistent with the multiproof workers backing `trie_handle`; otherwise the EVM may
+    /// read state from `BlockchainProvider::state_by_block_hash`, which can lag the engine
+    /// tree's `EngineApiTreeState` between newPayload and forkchoiceUpdated and yield a wrong
+    /// state root.
+    #[debug(skip)]
+    pub state_provider: Option<StateProviderBox>,
 }
 
 impl<T: PayloadAttributes> BuildNewPayload<T> {

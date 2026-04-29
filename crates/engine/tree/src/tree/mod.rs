@@ -106,12 +106,18 @@ pub enum SparseTrieHandleError {
 }
 
 /// Engine tree build context shared with payload-building callers.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub struct SparseTrieBuildContext {
     /// Execution cache anchored to the same parent/live tree view.
     pub cache: Option<SavedCache>,
     /// Sparse trie / state-root handle anchored to the same parent/live tree view.
     pub trie_handle: Option<StateRootHandle>,
+    /// State provider anchored to the same parent view as `trie_handle`.
+    ///
+    /// Built from the engine tree's `EngineApiTreeState` so EVM execution sees the same anchor +
+    /// in-memory blocks the multiproof workers compute against.
+    #[debug(skip)]
+    pub state_provider: Option<reth_provider::StateProviderBox>,
 }
 
 /// Request sent to the engine tree to create a sparse trie / state-root handle anchored to a
@@ -637,7 +643,12 @@ where
                         &self.state,
                     );
                     let cache = self.payload_validator.cache_for(req.parent_hash);
-                    let ctx = SparseTrieBuildContext { cache, trie_handle };
+                    let state_provider = self
+                        .payload_validator
+                        .state_provider_for(req.parent_hash, &self.state)
+                        .ok()
+                        .flatten();
+                    let ctx = SparseTrieBuildContext { cache, trie_handle, state_provider };
                     if let Err(err) = req.tx.send(Some(ctx)) {
                         warn!(
                             target: "engine::tree",
@@ -3314,14 +3325,20 @@ where
             None
         };
 
-        let trie_handle = if self.config.share_sparse_trie_with_payload_builder() {
-            self.payload_validator.sparse_trie_handle_for(
+        let (trie_handle, state_provider) = if self.config.share_sparse_trie_with_payload_builder() {
+            let trie_handle = self.payload_validator.sparse_trie_handle_for(
                 state.head_block_hash,
                 head.state_root(),
                 &self.state,
-            )
+            );
+            let state_provider = self
+                .payload_validator
+                .state_provider_for(state.head_block_hash, &self.state)
+                .ok()
+                .flatten();
+            (trie_handle, state_provider)
         } else {
-            None
+            (None, None)
         };
 
         // send the payload to the builder and return the receiver for the pending payload
@@ -3331,6 +3348,7 @@ where
             attributes,
             cache,
             trie_handle,
+            state_provider,
         });
 
         // Client software MUST respond to this method call in the following way:

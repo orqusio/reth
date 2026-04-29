@@ -161,13 +161,17 @@ where
         mut cached_reads,
         execution_cache,
         trie_handle,
+        state_provider: engine_state_provider,
         config,
         cancel,
         best_payload,
     } = args;
     let PayloadConfig { parent_header, attributes, payload_id } = config;
 
-    let mut state_provider = client.state_by_block_hash(parent_header.hash())?;
+    let mut state_provider = match engine_state_provider {
+        Some(provider) => provider,
+        None => client.state_by_block_hash(parent_header.hash())?,
+    };
     if let Some(execution_cache) = execution_cache {
         state_provider = Box::new(CachedStateProvider::new(
             state_provider,
