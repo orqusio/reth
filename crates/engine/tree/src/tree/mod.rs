@@ -23,7 +23,7 @@ use reth_engine_primitives::{
 };
 use reth_errors::{ConsensusError, ProviderResult};
 use reth_evm::ConfigureEvm;
-use reth_payload_builder::{BuildNewPayload, PayloadBuilderHandle};
+use reth_payload_builder::{BuildNewPayload, ParentHeaderBox, PayloadBuilderHandle};
 use reth_payload_primitives::{BuiltPayload, NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
     FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
@@ -108,6 +108,12 @@ pub enum SparseTrieHandleError {
 /// Engine tree build context shared with payload-building callers.
 #[derive(derive_more::Debug)]
 pub struct SparseTrieBuildContext {
+    /// Parent header from the engine tree's in-memory view.
+    ///
+    /// Payload builders can use this to create a build job before the parent is persisted to the
+    /// provider database.
+    #[debug(skip)]
+    pub parent_header: Option<ParentHeaderBox>,
     /// Execution cache anchored to the same parent/live tree view.
     pub cache: Option<SavedCache>,
     /// Sparse trie / state-root handle anchored to the same parent/live tree view.
@@ -125,7 +131,7 @@ pub struct SparseTrieBuildContext {
 #[derive(Debug)]
 pub struct SparseTrieHandleRequest {
     parent_hash: B256,
-    parent_state_root: B256,
+    parent_state_root: Option<B256>,
     tx: oneshot::Sender<Option<SparseTrieBuildContext>>,
 }
 
@@ -148,7 +154,24 @@ impl SparseTrieHandleSender {
     ) -> Result<Option<SparseTrieBuildContext>, SparseTrieHandleError> {
         let (tx, rx) = oneshot::channel::<Option<SparseTrieBuildContext>>();
         self.tx
-            .send(SparseTrieHandleRequest { parent_hash, parent_state_root, tx })
+            .send(SparseTrieHandleRequest {
+                parent_hash,
+                parent_state_root: Some(parent_state_root),
+                tx,
+            })
+            .map_err(|_| SparseTrieHandleError::RequestChannelClosed)?;
+        rx.await.map_err(|_| SparseTrieHandleError::ResponseChannelClosed)
+    }
+
+    /// Requests a sparse trie / state-root handle from the engine tree for the given parent,
+    /// resolving the parent header/state root from the engine tree's in-memory state.
+    pub async fn spawn_sparse_trie_build_context(
+        &self,
+        parent_hash: B256,
+    ) -> Result<Option<SparseTrieBuildContext>, SparseTrieHandleError> {
+        let (tx, rx) = oneshot::channel::<Option<SparseTrieBuildContext>>();
+        self.tx
+            .send(SparseTrieHandleRequest { parent_hash, parent_state_root: None, tx })
             .map_err(|_| SparseTrieHandleError::RequestChannelClosed)?;
         rx.await.map_err(|_| SparseTrieHandleError::ResponseChannelClosed)
     }
@@ -489,8 +512,7 @@ where
         Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
         UnboundedReceiver<EngineApiEvent<N>>,
         SparseTrieHandleSender,
-    )
-    {
+    ) {
         let best_block_number = provider.best_block_number().unwrap_or(0);
         let header = provider.sealed_header(best_block_number).ok().flatten().unwrap_or_default();
 
@@ -637,9 +659,28 @@ where
                     }
                 }
                 LoopEvent::TrieHandleRequest(req) => {
+                    let parent_header = match self.sealed_header_by_hash(req.parent_hash) {
+                        Ok(Some(header)) => header,
+                        Ok(None) => {
+                            let _ = req.tx.send(None);
+                            continue
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "engine::tree",
+                                parent_hash = %req.parent_hash,
+                                %err,
+                                "failed to resolve parent header for sparse trie handle request"
+                            );
+                            let _ = req.tx.send(None);
+                            continue
+                        }
+                    };
+                    let parent_state_root =
+                        req.parent_state_root.unwrap_or_else(|| parent_header.state_root());
                     let trie_handle = self.payload_validator.sparse_trie_handle_for(
                         req.parent_hash,
-                        req.parent_state_root,
+                        parent_state_root,
                         &self.state,
                     );
                     let cache = self.payload_validator.cache_for(req.parent_hash);
@@ -648,12 +689,17 @@ where
                         .state_provider_for(req.parent_hash, &self.state)
                         .ok()
                         .flatten();
-                    let ctx = SparseTrieBuildContext { cache, trie_handle, state_provider };
+                    let ctx = SparseTrieBuildContext {
+                        parent_header: Some(Box::new(parent_header)),
+                        cache,
+                        trie_handle,
+                        state_provider,
+                    };
                     if let Err(err) = req.tx.send(Some(ctx)) {
                         warn!(
                             target: "engine::tree",
                             parent_hash = %req.parent_hash,
-                            parent_state_root = %req.parent_state_root,
+                            parent_state_root = %parent_state_root,
                             "failed to deliver sparse trie handle response, receiver dropped: {err:?}"
                         );
                     }
@@ -3325,7 +3371,8 @@ where
             None
         };
 
-        let (trie_handle, state_provider) = if self.config.share_sparse_trie_with_payload_builder() {
+        let (trie_handle, state_provider) = if self.config.share_sparse_trie_with_payload_builder()
+        {
             let trie_handle = self.payload_validator.sparse_trie_handle_for(
                 state.head_block_hash,
                 head.state_root(),
@@ -3345,6 +3392,7 @@ where
         // id, initiating payload job is handled asynchronously
         let pending_payload_id = self.payload_builder.send_new_payload(BuildNewPayload {
             parent_hash: state.head_block_hash,
+            parent_header: Some(Box::new(head.clone())),
             attributes,
             cache,
             trie_handle,

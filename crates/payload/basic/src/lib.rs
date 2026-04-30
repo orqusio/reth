@@ -147,7 +147,15 @@ where
         input: BuildNewPayload<Builder::Attributes>,
         id: PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError> {
-        let parent_header = if input.parent_hash.is_zero() {
+        let parent_header = if let Some(parent_header) = input.parent_header {
+            *parent_header
+                .downcast::<SealedHeader<HeaderForPayload<Builder::BuiltPayload>>>()
+                .map_err(|_| {
+                    PayloadBuilderError::other(std::io::Error::other(
+                        "provided parent header type mismatch",
+                    ))
+                })?
+        } else if input.parent_hash.is_zero() {
             // Use latest header for genesis block case
             self.client
                 .latest_header()

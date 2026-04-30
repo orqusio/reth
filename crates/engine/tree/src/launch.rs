@@ -10,7 +10,9 @@ use crate::{
     download::BasicBlockDownloader,
     engine::{EngineApiKind, EngineApiRequest, EngineApiRequestHandler, EngineHandler},
     persistence::PersistenceHandle,
-    tree::{EngineApiTreeHandler, EngineValidator, SparseTrieHandleSender, TreeConfig, WaitForCaches},
+    tree::{
+        EngineApiTreeHandler, EngineValidator, SparseTrieHandleSender, TreeConfig, WaitForCaches,
+    },
 };
 use futures::Stream;
 use reth_consensus::FullConsensus;
@@ -67,12 +69,12 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     runtime: Runtime,
 ) -> (
     ChainOrchestrator<
-    EngineHandler<
-        EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
-        S,
-        BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
-    >,
-    PipelineSync<N>,
+        EngineHandler<
+            EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
+            S,
+            BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
+        >,
+        PipelineSync<N>,
     >,
     SparseTrieHandleSender,
 )

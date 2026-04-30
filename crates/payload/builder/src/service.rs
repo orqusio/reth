@@ -19,6 +19,7 @@ use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_storage_api::StateProviderBox;
 use reth_trie_parallel::state_root_task::StateRootHandle;
 use std::{
+    any::Any,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -33,6 +34,12 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, debug_span, info, trace, warn, Span};
 
 type PayloadFuture<P> = Pin<Box<dyn Future<Output = Result<P, PayloadBuilderError>> + Send>>;
+
+/// Type-erased parent header supplied by callers that already have a live engine-tree view.
+///
+/// Payload job generators downcast this to their concrete header type. This lets external
+/// builders use an in-memory parent before the provider has persisted it.
+pub type ParentHeaderBox = Box<dyn Any + Send + Sync + 'static>;
 
 /// A communication channel to the [`PayloadBuilderService`] that can retrieve payloads.
 ///
@@ -541,6 +548,9 @@ pub struct BuildNewPayload<T: std::fmt::Debug> {
     pub attributes: T,
     /// The parent hash of the new payload
     pub parent_hash: B256,
+    /// Optional parent header from an in-memory engine-tree view.
+    #[debug(skip)]
+    pub parent_header: Option<ParentHeaderBox>,
     /// Optional execution cache to use for the payload.
     ///
     /// Only provided if `--engine.share-execution-cache-with-payload-builder` is enabled.
